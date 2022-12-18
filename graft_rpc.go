@@ -20,6 +20,8 @@ func (m *GraftInstance[T]) startRPCServer() {
 
 	// register this as a server and start it in a new goroutine
 	server := grpc.NewServer()
+	pb.RegisterGraftServer(server, m)
+
 	go func() {
 		if err := server.Serve(lis); err != nil {
 			panic(err)

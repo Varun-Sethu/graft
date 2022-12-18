@@ -8,8 +8,8 @@ election timeout and all the machines + addresses of those machines in the clust
 # electionTimeout is measured in miliseconds, this should be configured based on the average request time between machines in the cluster
 electionTimeout: 150
 configuration:
-  alpha: tomato
-  beta: gamma
+  1: tomato
+  2: gamma
 ```
 
 The library is designed to "sit beneath your application layer" and just work, once you have configured your cluster you can start an instance of graft as follows:

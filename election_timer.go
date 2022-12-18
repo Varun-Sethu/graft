@@ -48,6 +48,13 @@ func (t *electionTimer) start() {
 	}()
 }
 
+func (t *electionTimer) disable() {
+	t.timerLock.Lock()
+	defer t.timerLock.Unlock()
+
+	t.timer.Stop()
+}
+
 // triggers a new raft term
 func (t *electionTimer) startNewTerm() {
 	t.timerLock.Lock()
