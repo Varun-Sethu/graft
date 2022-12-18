@@ -1,0 +1,4 @@
+electionTimeout: 150
+configuration:
+  1: tomato
+  2: gamma
