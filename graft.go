@@ -106,7 +106,6 @@ func (m *GraftInstance[T]) startElection() {
 
 	// request a vote from each client now
 	accumulatedVotes := int32(1)
-	logHead := m.log.GetHead()
 
 	for _, clusterMember := range m.cluster {
 		go func(clusterMember pb.GraftClient) {
@@ -115,8 +114,8 @@ func (m *GraftInstance[T]) startElection() {
 			voteResult, _ := clusterMember.RequestVote(ctx, &pb.RequestVoteArgs{
 				Term:         m.electionState.currentTerm,
 				CandidateId:  m.machineId,
-				LastLogIndex: int64(len(m.log.entries) - 1),
-				LastLogTerm:  int64(logHead.applicationTerm),
+				LastLogIndex: m.log.HeadIndex(),
+				LastLogTerm:  m.log.GetHead().applicationTerm,
 			})
 
 			if voteResult.VoteGranted {
@@ -140,7 +139,7 @@ func (m *GraftInstance[T]) RequestVote(ctx context.Context, args *pb.RequestVote
 	m.logLock.Lock()
 	defer m.logLock.Unlock()
 
-	logUpToDate := m.log.entries[args.LastLogIndex].applicationTerm == int(args.LastLogTerm)
+	logUpToDate := m.log.entries[args.LastLogIndex].applicationTerm == args.LastLogTerm
 	if args.Term < m.electionState.currentTerm || !logUpToDate || m.electionState.hasVoted {
 		return &pb.RequestVoteResponse{
 			VoteGranted: false,

@@ -2,7 +2,7 @@ package graft
 
 // LogEntry models an atomic operation that can be stored within the graft log
 type LogEntry[T any] struct {
-	applicationTerm int
+	applicationTerm int64
 	operation       T
 }
 
@@ -23,6 +23,12 @@ func NewLog[T any]() Log[T] {
 	}
 }
 
+// GetHead retrieves the head of the distributed log
 func (log Log[T]) GetHead() LogEntry[T] {
 	return log.entries[len(log.entries)-1]
+}
+
+// HeadIndex returns the index in the log in which the current log's head sits
+func (log Log[T]) HeadIndex() int64 {
+	return int64(len(log.entries) - 1)
 }
