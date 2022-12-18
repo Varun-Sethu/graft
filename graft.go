@@ -2,15 +2,10 @@ package graft
 
 import (
 	"context"
-	"fmt"
-	"io/ioutil"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"graft/pb"
-
-	"gopkg.in/yaml.v3"
 )
 
 type (
@@ -32,16 +27,17 @@ type (
 	// models any meta-data associated with an election
 	electionState struct {
 		electionStateLock sync.Mutex
-		electionTimer     *electionTimer
+		electionTimer     *triggerElectionTimer
 		currentTerm       int64
 		hasVoted          bool
 	}
 
 	// leaderState is volatile state that the machine maintains when elected leader
 	leaderState struct {
-		isLeader   bool
-		nextIndex  map[int64]int
-		matchIndex map[int64]int
+		leaderStateLock sync.Mutex
+		isLeader        bool
+		nextIndex       map[int64]int
+		matchIndex      map[int64]int
 	}
 )
 
@@ -77,19 +73,27 @@ func (m *GraftInstance[T]) InitFromConfig(configPath string, machineId int64) {
 	}
 
 	// construct the election timer and the leadership state
-	m.electionState.electionTimer = newElectionTimer(electionTimeoutBound /* onTimeout: */, m.triggerElection)
+	m.electionState.electionTimer = newElectionTimer(electionTimeoutBound /* electionTriggerCallback: */, m.startElection)
 	m.cluster = cluster
 	m.machineId = machineId
 }
 
 // switchToLeader toggles a machine as the new leader of the cluster
-// switchToFollower is the opposite direction
-func (m *GraftInstance[T]) switchToLeader()   { m.leaderState.isLeader = true }
-func (m *GraftInstance[T]) switchToFollower() { m.leaderState.isLeader = false }
+func (m *GraftInstance[T]) switchToLeader() {
+	m.leaderState.isLeader = true
+	m.electionState.electionTimer.disable()
+}
 
-// triggerElection starts an election and pushes out requests for votes from all candidates
+// switchToFollower is the opposite direction and moves the machine
+// to a follower state
+func (m *GraftInstance[T]) switchToFollower() {
+	m.leaderState.isLeader = false
+	m.electionState.electionTimer.start()
+}
+
+// startElection starts an election and pushes out requests for votes from all candidates
 // the cycle ends if we don't get enough votes :(
-func (m *GraftInstance[T]) triggerElection() {
+func (m *GraftInstance[T]) startElection() {
 	m.electionState.electionStateLock.Lock()
 	defer m.electionState.electionStateLock.Unlock()
 
@@ -97,7 +101,6 @@ func (m *GraftInstance[T]) triggerElection() {
 	defer m.logLock.Unlock()
 
 	// start new term and vote for yourself
-	m.electionState.electionTimer.disable()
 	m.electionState.currentTerm += 1
 	m.electionState.hasVoted = true
 
@@ -106,9 +109,9 @@ func (m *GraftInstance[T]) triggerElection() {
 	logHead := m.log.GetHead()
 
 	for _, clusterMember := range m.cluster {
-		go func() {
-			// TODO: not this :D, dont allow context leaks
-			ctx, _ := context.WithTimeout(context.Background(), 3*time.Second)
+		go func(clusterMember pb.GraftClient) {
+			// TODO: not this :D
+			ctx := context.TODO()
 			voteResult, _ := clusterMember.RequestVote(ctx, &pb.RequestVoteArgs{
 				Term:         m.electionState.currentTerm,
 				CandidateId:  m.machineId,
@@ -119,56 +122,35 @@ func (m *GraftInstance[T]) triggerElection() {
 			if voteResult.VoteGranted {
 				atomic.AddInt32(&accumulatedVotes, 1)
 			}
-		}()
+		}(clusterMember)
 	}
 
 	wonElection := accumulatedVotes > int32((len(m.cluster)+1)/2)
 	if wonElection {
 		m.switchToLeader()
-	} else {
-		m.switchToFollower()
-		m.electionState.electionTimer.startNewTerm()
 	}
 }
 
-// gRPC stub implementations
+// === gRPC stub implementations ===
 // RequestVote is invoked by a secondary machine in the cluster thats trying to acquire a vote from this machine
 func (m *GraftInstance[T]) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.RequestVoteResponse, error) {
 	m.electionState.electionStateLock.Lock()
-	m.logLock.Lock()
 	defer m.electionState.electionStateLock.Unlock()
+
+	m.logLock.Lock()
 	defer m.logLock.Unlock()
 
-	logUptoDate := m.log.entries[args.LastLogIndex].applicationTerm == int(args.LastLogTerm)
-
-	if args.Term < m.electionState.currentTerm || !logUptoDate {
+	logUpToDate := m.log.entries[args.LastLogIndex].applicationTerm == int(args.LastLogTerm)
+	if args.Term < m.electionState.currentTerm || !logUpToDate || m.electionState.hasVoted {
 		return &pb.RequestVoteResponse{
 			VoteGranted: false,
 			CurrentTerm: m.electionState.currentTerm,
 		}, nil
 	}
 
+	m.electionState.hasVoted = true
 	return &pb.RequestVoteResponse{
-		VoteGranted: false,
+		VoteGranted: true,
 		CurrentTerm: m.electionState.currentTerm,
 	}, nil
-}
-
-// General utility + configuration parsing
-// parseConfiguring parses a given configuration file
-func parseConfiguration(configPath string) (time.Duration, map[int64]string) {
-	yamlFile, err := ioutil.ReadFile(configPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to open yaml configuration: %w", err))
-	}
-
-	parsedYaml := make(map[interface{}]interface{})
-	if err = yaml.Unmarshal(yamlFile, &parsedYaml); err != nil {
-		panic(err)
-	}
-
-	clusterConfig := parsedYaml["configuration"].(map[int64]string)
-	electionTimeoutBound, _ := time.ParseDuration(parsedYaml["duration"].(string))
-
-	return electionTimeoutBound, clusterConfig
 }

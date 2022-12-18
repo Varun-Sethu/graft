@@ -8,65 +8,74 @@ import (
 
 // module for triggering events when the election timer is over
 type (
-	electionTimer struct {
+	triggerElectionTimer struct {
 		// electionTimeoutBound is a bound on how long our timeout for an election can last
 		// electionTimeouts can be in the range [electionTimeoutBound, 2 * electionTimeoutBound)
-		electionTimeoutBound time.Duration
+		electionTimeoutBound        time.Duration
+		currentElectTimeoutDuration time.Duration
 
 		timer     *time.Timer
 		timerLock sync.Mutex
 
-		resetChannel   chan struct{}
-		triggerNewTerm func()
+		enabled                 bool
+		enableLock              sync.Mutex
+		resetChannel            chan struct{}
+		electionTriggerCallback func()
 	}
 )
 
-func newElectionTimer(timeoutBound time.Duration, triggerNewTerm func()) *electionTimer {
-	return &electionTimer{
-		electionTimeoutBound: timeoutBound,
-		triggerNewTerm:       triggerNewTerm,
-		resetChannel:         make(chan struct{}),
-		timerLock:            sync.Mutex{},
+// constructor for election timers
+func newElectionTimer(timeoutBound time.Duration, electionTriggerCallback func()) *triggerElectionTimer {
+	return &triggerElectionTimer{
+		electionTimeoutBound:    timeoutBound,
+		electionTriggerCallback: electionTriggerCallback,
+		resetChannel:            make(chan struct{}),
+		timerLock:               sync.Mutex{},
 	}
 }
 
-// starts the election timer
-func (t *electionTimer) start() {
-	electionTimeout := t.getNewElectionTimeout()
-	t.timer = time.AfterFunc(electionTimeout, func() {
-		t.startNewTerm()
-		t.triggerNewTerm()
-	})
-
-	// the main timer loop
-	go func() {
-		for range t.resetChannel {
-			t.timerLock.Lock()
-			t.timer.Reset(electionTimeout)
-			t.timerLock.Unlock()
-		}
-	}()
+// start starts the election timer, also used to restart a timer after its been disabled
+func (t *triggerElectionTimer) start() {
+	electionTimeout := getRandomTimeoutDuration(t.electionTimeoutBound)
+	t.currentElectTimeoutDuration = electionTimeout
+	t.timer = time.AfterFunc(electionTimeout, t.triggerElection)
 }
 
-func (t *electionTimer) disable() {
+// triggerElection triggers a new raft election by resetting the timer and invoking the election callback
+func (t *triggerElectionTimer) triggerElection() {
 	t.timerLock.Lock()
 	defer t.timerLock.Unlock()
 
 	t.timer.Stop()
+	t.electionTriggerCallback()
+
+	t.enableLock.Lock()
+	defer t.enableLock.Unlock()
+	if t.enabled {
+		t.start()
+	}
 }
 
-// triggers a new raft term
-func (t *electionTimer) startNewTerm() {
+// disable triggers the timer to move as if it was under a leader
+// ie. do nothing :)
+func (t *triggerElectionTimer) disable() {
+	t.enableLock.Lock()
+	defer t.enableLock.Unlock()
+	t.enabled = false
+}
+
+// reset resets the election timer completely
+func (t *triggerElectionTimer) reset() {
 	t.timerLock.Lock()
 	defer t.timerLock.Unlock()
 
-	newTimeout := t.getNewElectionTimeout()
-	t.timer.Reset(newTimeout)
+	t.timer.Reset(t.currentElectTimeoutDuration)
 }
 
-func (t *electionTimer) getNewElectionTimeout() time.Duration {
+// getRandomTimeoutDuration generates a randomized timeout duration
+func getRandomTimeoutDuration(timeoutBound time.Duration) time.Duration {
 	rand.Seed(time.Now().Unix())
-	newTimeout := rand.Int63n(t.electionTimeoutBound.Milliseconds()) + t.electionTimeoutBound.Milliseconds()
+	newTimeout := rand.Int63n(int64(timeoutBound.Milliseconds())) + timeoutBound.Milliseconds()
 
 	return time.Duration(newTimeout)
 }
