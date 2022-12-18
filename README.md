@@ -30,9 +30,8 @@ func main() {
     graftInstance := NewGraftInstance[StateMachineOperation](operationCallback)
 
     // start up the RPC server for this member and connect to the other members in the cluster
-    graftInstance.InitFromConfig(GRAFT_CONFIG, machineId)
     // non-blocking
-    graftInstance.Start()
+    graftInstance.StartFromConfig(GRAFT_CONFIG, machineId)
 }
 ```
 I required there are some examples within the `examples/` folder, the main one being a replicated key-value store. In the future I will add a sharded key-value store.

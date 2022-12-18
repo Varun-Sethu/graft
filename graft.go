@@ -2,10 +2,19 @@ package graft
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"graft/pb"
+
+	"google.golang.org/grpc"
+)
+
+const (
+	HEARTBEAT_DURATION = 50 * time.Millisecond
 )
 
 type (
@@ -27,23 +36,27 @@ type (
 	// models any meta-data associated with an election
 	electionState struct {
 		electionStateLock sync.Mutex
-		electionTimer     *triggerElectionTimer
-		currentTerm       int64
-		hasVoted          bool
+
+		electionTimer *triggerElectionTimer
+		currentTerm   int64
+		hasVoted      bool
 	}
 
 	// leaderState is volatile state that the machine maintains when elected leader
 	leaderState struct {
 		leaderStateLock sync.Mutex
-		isLeader        bool
-		nextIndex       map[int64]int
-		matchIndex      map[int64]int
+
+		heartbeatTimer *time.Timer
+		isLeader       bool
+		nextIndex      map[int64]int
+		matchIndex     map[int64]int
 	}
 )
 
 // CreateGraftInstance creates a global graft instance thats ready to be spun up :)
 // configPath is the path to the yaml file that contains the configuration for this raft cluster
 // operationHandler is the handler invoked when the distributed log has committed an operation
+// note: by default each graft instance starts off as a follower
 func CreateGraftInstance[T any](operationHandler func(T)) *GraftInstance[T] {
 	return &GraftInstance[T]{
 		leaderState: leaderState{
@@ -55,9 +68,9 @@ func CreateGraftInstance[T any](operationHandler func(T)) *GraftInstance[T] {
 	}
 }
 
-// InitFromConfig initializes the graft instance by parsing the provided config, starting an RPC server and then connecting to
-// the RPC servers for the other members of the cluster
-func (m *GraftInstance[T]) InitFromConfig(configPath string, machineId int64) {
+// StartFromConfig starts the graft instance by parsing the provided config, starting an RPC server and then connecting to
+// the RPC servers for the other members of the cluster, it then starts the instance off as a follower
+func (m *GraftInstance[T]) StartFromConfig(configPath string, machineId int64) {
 	m.startRPCServer()
 
 	electionTimeoutBound, clusterConfig := parseConfiguration(configPath)
@@ -72,16 +85,23 @@ func (m *GraftInstance[T]) InitFromConfig(configPath string, machineId int64) {
 		}
 	}
 
-	// construct the election timer and the leadership state
-	m.electionState.electionTimer = newElectionTimer(electionTimeoutBound /* electionTriggerCallback: */, m.startElection)
+	// general metadata
 	m.cluster = cluster
 	m.machineId = machineId
+
+	// construct the election timer and the leadership state
+	m.electionState.electionTimer = newElectionTimer(electionTimeoutBound /* electionTriggerCallback: */, m.startElection)
+	m.leaderState.heartbeatTimer = time.AfterFunc(HEARTBEAT_DURATION, m.sendHeartbeat)
+	m.leaderState.heartbeatTimer.Stop()
+
+	m.switchToFollower()
 }
 
 // switchToLeader toggles a machine as the new leader of the cluster
 func (m *GraftInstance[T]) switchToLeader() {
 	m.leaderState.isLeader = true
 	m.electionState.electionTimer.disable()
+	m.leaderState.heartbeatTimer.Reset(HEARTBEAT_DURATION)
 }
 
 // switchToFollower is the opposite direction and moves the machine
@@ -130,6 +150,16 @@ func (m *GraftInstance[T]) startElection() {
 	}
 }
 
+// sendHeartbeat is the heartbeat function that leaders use to assert dominance over followers
+func (m *GraftInstance[T]) sendHeartbeat() {
+	for _, clusterMember := range m.cluster {
+		fmt.Print(clusterMember)
+		// send heartbeat
+	}
+
+	m.leaderState.heartbeatTimer.Reset(HEARTBEAT_DURATION)
+}
+
 // === gRPC stub implementations ===
 // RequestVote is invoked by a secondary machine in the cluster thats trying to acquire a vote from this machine
 func (m *GraftInstance[T]) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.RequestVoteResponse, error) {
@@ -152,4 +182,40 @@ func (m *GraftInstance[T]) RequestVote(ctx context.Context, args *pb.RequestVote
 		VoteGranted: true,
 		CurrentTerm: m.electionState.currentTerm,
 	}, nil
+}
+
+// RPC helper functions
+// small interface for communicating with the other machines in the cluster
+// the assumption here is that all the other machines have spun up RPC servers and are capable of starting requests
+// hence the initialization method should only be called AFTER starting an RPC server
+func (m *GraftInstance[T]) startRPCServer() {
+	// start an RPC server on 8080
+	lis, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		panic(err)
+	}
+
+	// register this as a server and start it in a new goroutine
+	server := grpc.NewServer()
+	pb.RegisterGraftServer(server, m)
+
+	go func() {
+		if err := server.Serve(lis); err != nil {
+			panic(err)
+		}
+	}()
+}
+
+// connectToClusterMember attempts to dial a cluster member and establish an rpc connection
+// with them
+func connectToClusterMember(addr string) pb.GraftClient {
+	opts := []grpc.DialOption{}
+
+	conn, err := grpc.Dial(addr, opts...)
+	if err != nil {
+		panic(err)
+	}
+
+	// TODO: close the conn eventually
+	return pb.NewGraftClient(conn)
 }
