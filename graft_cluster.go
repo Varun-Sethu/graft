@@ -2,8 +2,6 @@ package graft
 
 import (
 	"context"
-	"fmt"
-	"io/ioutil"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,7 +9,6 @@ import (
 	"graft/pb"
 
 	"google.golang.org/grpc"
-	"gopkg.in/yaml.v3"
 )
 
 // models an actual cluster of graft instances and provides abstractions for interfacing with all of them
@@ -29,15 +26,14 @@ type (
 )
 
 // clusterFromConfig creates a cluster struct and connects to all other machines in the cluster
-func clusterFromConfig(thisMachinesID machineID, graftConfigPath string) *cluster {
-	clusterConfiguration := parseClusterConfig(graftConfigPath)
+func clusterFromConfig(config graftConfig, thisMachinesID machineID) *cluster {
 	newCluster := cluster{
 		machines:                 make(map[machineID]pb.GraftClient),
 		machineCancellationFuncs: make(map[machineID]context.CancelFunc),
 		currentLeader:            unknownLeader,
 	}
 
-	for machineID, machineAddr := range clusterConfiguration {
+	for machineID, machineAddr := range config.clusterConfig {
 		if machineID == thisMachinesID {
 			continue
 		}
@@ -50,36 +46,29 @@ func clusterFromConfig(thisMachinesID machineID, graftConfigPath string) *cluste
 }
 
 // pushEntries pushes entries to all entities within the cluster
-func (c *cluster) pushEntryToClusterMember(machineID machineID, entry *pb.AppendEntriesArgs) {
+// TODO: figure out how to propagate results to the caller
+func (c *cluster) pushEntryToClusterMember(machineID machineID, entry *pb.AppendEntriesArgs) *pb.AppendEntriesResponse {
 	// cancel any outbound request and create a new one
 	cancelExistingReq := c.machineCancellationFuncs[machineID]
-
 	cancelExistingReq()
+
 	machineContext, cancelFunc := context.WithCancel(context.Background())
 	c.machineCancellationFuncs[machineID] = cancelFunc
-
 	clusterMachine := c.machines[machineID]
-	timedOut := func(ctx context.Context) bool {
-		select {
-		case <-ctx.Done():
-			return true
-		default:
-			return false
+
+	// repeatedly try sending a request
+	for {
+		ctx, cancel := context.WithTimeout(machineContext, 100*time.Millisecond)
+		result, _ := clusterMachine.AppendEntries(ctx, entry)
+
+		// if we timed out resend the request, otherwise exist this loop
+		timedOut := ctx.Err() == context.DeadlineExceeded
+		if !timedOut || machineContext.Err() == context.Canceled {
+			return result
 		}
+
+		cancel()
 	}
-
-	go func() {
-		for {
-			ctx, cancel := context.WithTimeout(machineContext, 10*time.Millisecond)
-			defer cancel()
-			clusterMachine.AppendEntries(ctx, entry)
-
-			// if we timed out resend the request, otherwise exist this loop
-			if !timedOut(ctx) {
-				break
-			}
-		}
-	}()
 }
 
 // requestVote requests a vote from each member of the cluster and accumulates the total
@@ -115,27 +104,6 @@ func (c *cluster) cancelAllOutboundReqs() {
 	for _, cancelExistingReq := range c.machineCancellationFuncs {
 		cancelExistingReq()
 	}
-}
-
-// parseClusterConfig parses the cluster_configuration of the graft config file
-// it looks something like:
-// election_timeout: 150
-// cluster_configuration:
-//   1: tomato
-//   2: gamma
-func parseClusterConfig(graftConfigPath string) map[machineID]string {
-	yamlFile, err := ioutil.ReadFile(graftConfigPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to open yaml configuration: %w", err))
-	}
-
-	parsedYaml := make(map[interface{}]interface{})
-	if err = yaml.Unmarshal(yamlFile, &parsedYaml); err != nil {
-		panic(err)
-	}
-
-	clusterConfig := parsedYaml["cluster_configuration"].(map[machineID]string)
-	return clusterConfig
 }
 
 func connectToMachine(addr string) pb.GraftClient {
