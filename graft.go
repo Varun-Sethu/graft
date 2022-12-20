@@ -2,7 +2,7 @@ package graft
 
 import (
 	"context"
-	"fmt"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -27,6 +27,7 @@ type (
 		log           Log[T]
 
 		operationHandler func(T)
+		serializer       Serializer[T]
 		cluster          map[int64]pb.GraftClient
 
 		// grpc implementation
@@ -57,7 +58,7 @@ type (
 // configPath is the path to the yaml file that contains the configuration for this raft cluster
 // operationHandler is the handler invoked when the distributed log has committed an operation
 // note: by default each graft instance starts off as a follower
-func CreateGraftInstance[T any](operationHandler func(T)) *GraftInstance[T] {
+func CreateGraftInstance[T any](operationHandler func(T), serializer Serializer[T]) *GraftInstance[T] {
 	return &GraftInstance[T]{
 		leaderState: leaderState{
 			nextIndex:  make(map[int64]int),
@@ -109,6 +110,7 @@ func (m *GraftInstance[T]) switchToLeader() {
 func (m *GraftInstance[T]) switchToFollower() {
 	m.leaderState.isLeader = false
 	m.electionState.electionTimer.start()
+	m.leaderState.heartbeatTimer.Stop()
 }
 
 // startElection starts an election and pushes out requests for votes from all candidates
@@ -153,8 +155,8 @@ func (m *GraftInstance[T]) startElection() {
 // sendHeartbeat is the heartbeat function that leaders use to assert dominance over followers
 func (m *GraftInstance[T]) sendHeartbeat() {
 	for _, clusterMember := range m.cluster {
-		fmt.Print(clusterMember)
-		// send heartbeat
+		go func(clusterMember pb.GraftClient) {
+		}(clusterMember)
 	}
 
 	m.leaderState.heartbeatTimer.Reset(HEARTBEAT_DURATION)
@@ -181,6 +183,50 @@ func (m *GraftInstance[T]) RequestVote(ctx context.Context, args *pb.RequestVote
 	return &pb.RequestVoteResponse{
 		VoteGranted: true,
 		CurrentTerm: m.electionState.currentTerm,
+	}, nil
+}
+
+// AppendEntries is the appendEntries RPC in the original raft paper, the arguments are defined in the proto file
+func (m *GraftInstance[T]) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*pb.AppendEntriesResponse, error) {
+	m.electionState.electionStateLock.Lock()
+	defer m.electionState.electionStateLock.Unlock()
+
+	m.logLock.Lock()
+	defer m.logLock.Unlock()
+
+	if args.Term < m.electionState.currentTerm || m.log.entries[args.PrevLogIndex].applicationTerm != args.PrevLogTerm {
+		return &pb.AppendEntriesResponse{
+			CurrentTerm: m.electionState.currentTerm,
+			Accepted:    false,
+		}, nil
+	}
+
+	// apply the entries to the log now :)
+	parsedEntries := m.parseEntries(args.Entries)
+	newEntries := parsedEntries[int(args.PrevLogIndex)-len(m.log.entries)-1:]
+	overriddenEntries := parsedEntries[:int(args.PrevLogIndex)-len(m.log.entries)-1]
+
+	// override entries
+	for i, v := range overriddenEntries {
+		m.log.entries[len(m.log.entries)-i] = v
+	}
+
+	// append new entries
+	m.log.entries = append(m.log.entries, newEntries...)
+
+	// finally it may be time to start committing entries
+	newCommitIndex := int(math.Min(float64(args.LeaderCommit), float64(len(m.log.entries))))
+	if args.LeaderCommit > int64(m.log.lastCommitted) {
+		for _, logEntry := range m.log.entries[m.log.lastCommitted:newCommitIndex] {
+			m.operationHandler(logEntry.operation)
+		}
+
+		m.log.lastCommitted = newCommitIndex
+	}
+
+	return &pb.AppendEntriesResponse{
+		CurrentTerm: m.electionState.currentTerm,
+		Accepted:    true,
 	}, nil
 }
 
@@ -218,4 +264,16 @@ func connectToClusterMember(addr string) pb.GraftClient {
 
 	// TODO: close the conn eventually
 	return pb.NewGraftClient(conn)
+}
+
+func (m *GraftInstance[T]) parseEntries(entries []*pb.LogEntry) []LogEntry[T] {
+	parsedEntries := []LogEntry[T]{}
+	for _, entry := range entries {
+		parsedEntries = append(parsedEntries, LogEntry[T]{
+			applicationTerm: entry.ApplicationTerm,
+			operation:       m.serializer.FromString(entry.Entry),
+		})
+	}
+
+	return parsedEntries
 }

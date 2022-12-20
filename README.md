@@ -26,8 +26,17 @@ type StateMachineOperation struct {
 // ideally this function is what will end up 
 func operationCallback(op StateMachineOperation) {}
 
+// you need to also define methods so that your operation can be serialized and deserialized over a network
+func ToString(StateMachineOperation) string { /* ... */ }
+func FromString(string) StateMachineOperation { /* ... */ }
+
+
 func main() {
-    graftInstance := NewGraftInstance[StateMachineOperation](operationCallback)
+    // instantiate a graft instance with a serializer
+    graftInstance := NewGraftInstance[StateMachineOperation](operationCallback, Serializer{
+        ToString: ToString
+        FromString: FromString
+    })
 
     // start up the RPC server for this member and connect to the other members in the cluster
     // non-blocking
