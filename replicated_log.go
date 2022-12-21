@@ -39,6 +39,29 @@ func (log *Log[T]) GetHead() LogEntry[T] {
 	return log.entries[len(log.entries)-1]
 }
 
+// ApplyEntries duplicates all entries from a server onto the log
+func (log *Log[T]) ApplyEntries(entries []*pb.LogEntry, prevIndex int, prevTerm int64) {
+	numNewEntries := len(log.entries) - 1 - prevIndex
+	entryOverrides := entries[:numNewEntries]
+	newEntries := entries[numNewEntries:]
+
+	// first replace any overridden entries
+	for i, v := range entryOverrides {
+		indexToOverride := len(log.entries) - len(entryOverrides) + i
+
+		log.entries[indexToOverride].applicationTerm = v.ApplicationTerm
+		log.entries[indexToOverride].operation = log.serializer.FromString(v.Entry)
+	}
+
+	// then append any new entries
+	for _, v := range newEntries {
+		log.entries = append(log.entries, LogEntry[T]{
+			applicationTerm: v.ApplicationTerm,
+			operation:       log.serializer.FromString(v.Entry),
+		})
+	}
+}
+
 // SerializeRange returns all entries in the log within a range but serialized using the serializer
 // the goal is that they should be ready to transmit over gRPC
 func (log *Log[T]) SerializeSubset(rangeStart int) []*pb.LogEntry {

@@ -74,8 +74,11 @@ func (c *cluster) pushEntryToClusterMember(machineID machineID, entry *pb.Append
 }
 
 // requestVote requests a vote from each member of the cluster and accumulates the total
-func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) int {
+// returns the total vote and the current term
+func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
 	totalVotes := int32(0)
+	termLock := sync.Mutex{}
+	newTerm := 0
 
 	// voting wait group
 	wg := sync.WaitGroup{}
@@ -92,12 +95,18 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) int {
 				atomic.AddInt32(&totalVotes, 1)
 			}
 
+			termLock.Lock()
+			if voteResult.CurrentTerm > int64(newTerm) {
+				newTerm = int(voteResult.CurrentTerm)
+			}
+			termLock.Unlock()
+
 			wg.Done()
 		}(clusterMachine())
 	}
 
 	wg.Wait()
-	return int(totalVotes)
+	return int(totalVotes), newTerm
 }
 
 // cancelAllOutboundReqs terminates every single outbound request to any machine in the cluster
