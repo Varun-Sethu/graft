@@ -15,20 +15,21 @@ import (
 const unknownLeader = 0
 
 type (
-	machineID uint64
-	cluster   struct {
+	machineID  = int64
+	lazyClient func() pb.GraftClient
+	cluster    struct {
 		// machines are the gRPC clients for all the machines in the cluster
 		// while machineContext maps machines to any active cancelable contexts
-		machines                 map[machineID]pb.GraftClient
+		machines                 map[machineID]lazyClient
 		machineCancellationFuncs map[machineID]context.CancelFunc
 		currentLeader            machineID
 	}
 )
 
-// clusterFromConfig creates a cluster struct and connects to all other machines in the cluster
-func clusterFromConfig(config graftConfig, thisMachinesID machineID) *cluster {
+// newCluster creates a cluster struct and connects to all other machines in the cluster
+func connectToCluster(config graftConfig, thisMachinesID machineID) *cluster {
 	newCluster := cluster{
-		machines:                 make(map[machineID]pb.GraftClient),
+		machines:                 make(map[machineID]lazyClient),
 		machineCancellationFuncs: make(map[machineID]context.CancelFunc),
 		currentLeader:            unknownLeader,
 	}
@@ -46,7 +47,7 @@ func clusterFromConfig(config graftConfig, thisMachinesID machineID) *cluster {
 }
 
 // pushEntries pushes entries to all entities within the cluster
-// TODO: figure out how to propagate results to the caller
+// as per the raft specification this will retry the request indefinitely until it is cancelled
 func (c *cluster) pushEntryToClusterMember(machineID machineID, entry *pb.AppendEntriesArgs) *pb.AppendEntriesResponse {
 	// cancel any outbound request and create a new one
 	cancelExistingReq := c.machineCancellationFuncs[machineID]
@@ -59,11 +60,12 @@ func (c *cluster) pushEntryToClusterMember(machineID machineID, entry *pb.Append
 	// repeatedly try sending a request
 	for {
 		ctx, cancel := context.WithTimeout(machineContext, 100*time.Millisecond)
-		result, _ := clusterMachine.AppendEntries(ctx, entry)
+		defer cancel()
+		result, _ := clusterMachine().AppendEntries(ctx, entry)
 
 		// if we timed out resend the request, otherwise exist this loop
 		timedOut := ctx.Err() == context.DeadlineExceeded
-		if !timedOut || machineContext.Err() == context.Canceled {
+		if !timedOut {
 			return result
 		}
 
@@ -91,7 +93,7 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) int {
 			}
 
 			wg.Done()
-		}(clusterMachine)
+		}(clusterMachine())
 	}
 
 	wg.Wait()
@@ -106,14 +108,26 @@ func (c *cluster) cancelAllOutboundReqs() {
 	}
 }
 
-func connectToMachine(addr string) pb.GraftClient {
-	opts := []grpc.DialOption{}
+func (c *cluster) clusterSize() int { return len(c.machines) }
 
-	conn, err := grpc.Dial(addr, opts...)
-	if err != nil {
-		panic(err)
+// connects to a machine (lazily), ie the connection is only established when it is first used
+func connectToMachine(addr string) lazyClient {
+	var v pb.GraftClient
+	var once sync.Once
+
+	return func() pb.GraftClient {
+		once.Do(func() {
+			opts := []grpc.DialOption{}
+
+			conn, err := grpc.Dial(addr, opts...)
+			if err != nil {
+				panic(err)
+			}
+
+			// TODO: close the conn eventually
+			v = pb.NewGraftClient(conn)
+		})
+
+		return v
 	}
-
-	// TODO: close the conn eventually
-	return pb.NewGraftClient(conn)
 }

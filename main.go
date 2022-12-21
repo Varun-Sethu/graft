@@ -1,26 +1,27 @@
 package graft
 
 import (
-	"fmt"
-	"io/ioutil"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-type graftConfig struct {
-	clusterConfig           map[machineID]string
-	electionTimeoutDuration time.Duration
-}
-
-func parseGraftConfig(graftConfigPath string) graftConfig {
-	yamlFile, err := ioutil.ReadFile(graftConfigPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to open yaml configuration: %w", err))
+type (
+	// Serializer "typeclass" in which an instance must be passed to graft on instantiation
+	Serializer[T any] struct {
+		ToString   func(T) string
+		FromString func(string) T
 	}
 
+	graftConfig struct {
+		clusterConfig           map[machineID]string
+		electionTimeoutDuration time.Duration
+	}
+)
+
+func parseGraftConfig(yamlConfig []byte) graftConfig {
 	parsedYaml := make(map[interface{}]interface{})
-	if err = yaml.Unmarshal(yamlFile, &parsedYaml); err != nil {
+	if err := yaml.Unmarshal(yamlConfig, &parsedYaml); err != nil {
 		panic(err)
 	}
 
