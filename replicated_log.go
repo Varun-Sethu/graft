@@ -1,8 +1,6 @@
 package graft
 
 import (
-	"sync"
-
 	"graft/pb"
 )
 
@@ -16,31 +14,32 @@ type (
 	// Log actually models the full log on the current machine in the raft cluster
 	// + some additional metadata
 	Log[T any] struct {
-		sync.Mutex
+		serializer Serializer[T]
+		entries    []LogEntry[T]
 
-		serializer    Serializer[T]
-		entries       []LogEntry[T]
-		lastCommitted int
-		lastApplied   int
+		commitCallback func(T)
+		lastCommitted  int
+		lastApplied    int
 	}
 )
 
-// NewLog creates a Log for the machine in the raft cluster to consume
-func NewLog[T any]() Log[T] {
+// newLog creates a Log for the machine in the raft cluster to consume
+func newLog[T any](commitCallback func(T)) Log[T] {
 	return Log[T]{
-		entries:       []LogEntry[T]{},
-		lastCommitted: 0,
-		lastApplied:   0,
+		entries:        []LogEntry[T]{},
+		commitCallback: commitCallback,
+		lastCommitted:  0,
+		lastApplied:    0,
 	}
 }
 
-// GetHead retrieves the head of the distributed log
-func (log *Log[T]) GetHead() LogEntry[T] {
+// getLastEntry retrieves the head of the distributed log
+func (log *Log[T]) getLastEntry() LogEntry[T] {
 	return log.entries[len(log.entries)-1]
 }
 
-// ApplyEntries duplicates all entries from a server onto the log
-func (log *Log[T]) ApplyEntries(entries []*pb.LogEntry, prevIndex int, prevTerm int64) {
+// appendEntries duplicates all entries from a server onto the log
+func (log *Log[T]) appendEntries(entries []*pb.LogEntry, prevIndex int, prevTerm int64) {
 	numNewEntries := len(log.entries) - 1 - prevIndex
 	entryOverrides := entries[:numNewEntries]
 	newEntries := entries[numNewEntries:]
@@ -62,11 +61,21 @@ func (log *Log[T]) ApplyEntries(entries []*pb.LogEntry, prevIndex int, prevTerm 
 	}
 }
 
+// updateCommitIndex updates the log's commit index by sequentially committing everything from the last commit index to the new commit index
+func (log *Log[T]) updateCommitIndex(newCommitIndex int) {
+	newCommitIndex = min(newCommitIndex, len(log.entries))
+	for _, op := range log.entries[log.lastCommitted:newCommitIndex] {
+		log.commitCallback(op.operation)
+	}
+
+	log.lastCommitted = newCommitIndex
+}
+
 // SerializeRange returns all entries in the log within a range but serialized using the serializer
 // the goal is that they should be ready to transmit over gRPC
-func (log *Log[T]) SerializeSubset(rangeStart int) []*pb.LogEntry {
+func (log *Log[T]) serializeSubset(rangeStart, rangeEnd int) []*pb.LogEntry {
 	serializedResp := []*pb.LogEntry{}
-	for _, entry := range log.entries[rangeStart:] {
+	for _, entry := range log.entries[rangeStart:rangeEnd] {
 		serializedResp = append(serializedResp, &pb.LogEntry{
 			Entry:           log.serializer.ToString(entry.operation),
 			ApplicationTerm: entry.applicationTerm,
@@ -76,7 +85,14 @@ func (log *Log[T]) SerializeSubset(rangeStart int) []*pb.LogEntry {
 	return serializedResp
 }
 
-// HeadIndex returns the index in the log in which the current log's head sits
-func (log *Log[T]) HeadIndex() int64 {
+// lastIndex returns the index in the log in which the current log's head sits
+func (log *Log[T]) lastIndex() int64 {
 	return int64(len(log.entries) - 1)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

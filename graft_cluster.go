@@ -21,7 +21,7 @@ type (
 		// machines are the gRPC clients for all the machines in the cluster
 		// while machineContext maps machines to any active cancelable contexts
 		machines                 map[machineID]lazyClient
-		machineCancellationFuncs map[machineID]context.CancelFunc
+		machineCancellationFuncs sync.Map // equiv to: map[machineID]context.CancelFunc
 		currentLeader            machineID
 	}
 )
@@ -30,7 +30,7 @@ type (
 func connectToCluster(config graftConfig, thisMachinesID machineID) *cluster {
 	newCluster := cluster{
 		machines:                 make(map[machineID]lazyClient),
-		machineCancellationFuncs: make(map[machineID]context.CancelFunc),
+		machineCancellationFuncs: sync.Map{},
 		currentLeader:            unknownLeader,
 	}
 
@@ -40,45 +40,44 @@ func connectToCluster(config graftConfig, thisMachinesID machineID) *cluster {
 		}
 
 		newCluster.machines[machineID] = connectToMachine(machineAddr)
-		newCluster.machineCancellationFuncs[machineID] = func() {}
+		newCluster.machineCancellationFuncs.Store(machineID, func() {})
 	}
 
 	return &newCluster
 }
 
-// pushEntries pushes entries to all entities within the cluster
-// as per the raft specification this will retry the request indefinitely until it is cancelled
-func (c *cluster) pushEntryToClusterMember(machineID machineID, entry *pb.AppendEntriesArgs) *pb.AppendEntriesResponse {
+// pushEntries pushes entries to all entities within the cluster, primarily abstracts away any error handling involved with the
+// invocation of this append entries RPC, ie cancelling existing requests and timing out old ones
+func (c *cluster) appendEntryForMember(machineID machineID, entry *pb.AppendEntriesArgs, currentTerm int64) *pb.AppendEntriesResponse {
 	// cancel any outbound request and create a new one
-	cancelExistingReq := c.machineCancellationFuncs[machineID]
-	cancelExistingReq()
+	cancelExistingReqForMachine, _ := c.machineCancellationFuncs.Load(machineID)
+	cancelExistingReqForMachine.(func())()
 
 	machineContext, cancelFunc := context.WithCancel(context.Background())
-	c.machineCancellationFuncs[machineID] = cancelFunc
+	c.machineCancellationFuncs.Store(machineID, cancelFunc)
 	clusterMachine := c.machines[machineID]
 
-	// repeatedly try sending a request
-	for {
-		ctx, cancel := context.WithTimeout(machineContext, 100*time.Millisecond)
-		defer cancel()
-		result, _ := clusterMachine().AppendEntries(ctx, entry)
+	ctx, cancel := context.WithTimeout(machineContext, 100*time.Millisecond)
+	defer cancel()
 
-		// if we timed out resend the request, otherwise exist this loop
-		timedOut := ctx.Err() == context.DeadlineExceeded
-		if !timedOut {
-			return result
+	result, err := clusterMachine().AppendEntries(ctx, entry)
+	if err != nil {
+		return &pb.AppendEntriesResponse{
+			CurrentTerm: currentTerm,
+			Accepted:    false,
 		}
-
-		cancel()
 	}
+
+	return result
 }
 
 // requestVote requests a vote from each member of the cluster and accumulates the total
 // returns the total vote and the current term
 func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
-	totalVotes := int32(0)
 	termLock := sync.Mutex{}
-	newTerm := 0
+	newTerm := -1
+
+	totalVotes := int32(0)
 
 	// voting wait group
 	wg := sync.WaitGroup{}
@@ -87,11 +86,11 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
 	for _, clusterMachine := range c.machines {
 		// poll each machine in the cluster for a vote
 		go func(clusterMachine pb.GraftClient) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
 
-			voteResult, _ := clusterMachine.RequestVote(ctx, voteRequest)
-			if voteResult.VoteGranted {
+			voteResult, err := clusterMachine.RequestVote(ctx, voteRequest)
+			if err == nil && voteResult.VoteGranted {
 				atomic.AddInt32(&totalVotes, 1)
 			}
 
@@ -107,14 +106,6 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
 
 	wg.Wait()
 	return int(totalVotes), newTerm
-}
-
-// cancelAllOutboundReqs terminates every single outbound request to any machine in the cluster
-// this is primarily used when switching state from leader to follower
-func (c *cluster) cancelAllOutboundReqs() {
-	for _, cancelExistingReq := range c.machineCancellationFuncs {
-		cancelExistingReq()
-	}
 }
 
 func (c *cluster) clusterSize() int { return len(c.machines) }
