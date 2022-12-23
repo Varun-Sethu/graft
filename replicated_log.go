@@ -24,7 +24,7 @@ type (
 )
 
 // newLog creates a Log for the machine in the raft cluster to consume
-func newLog[T any](commitCallback func(T)) Log[T] {
+func newLog[T any](commitCallback func(T), serializer Serializer[T]) Log[T] {
 	return Log[T]{
 		entries:        []LogEntry[T]{},
 		commitCallback: commitCallback,

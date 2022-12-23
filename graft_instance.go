@@ -44,13 +44,13 @@ type (
 )
 
 // NewGraftInstance constructs a new graft instance however it starts off as disabled
-func NewGraftInstance[T any](configuration []byte, thisMachineID machineID, operationCommitCallback func(T)) *GraftInstance[T] {
+func NewGraftInstance[T any](configuration []byte, thisMachineID machineID, operationCommitCallback func(T), serializer Serializer[T]) *GraftInstance[T] {
 	graftConfig := parseGraftConfig(configuration)
 	cluster := connectToCluster(graftConfig, thisMachineID)
 	instance := &GraftInstance[T]{
 		machineId: thisMachineID,
 		cluster:   cluster,
-		log:       newLog(operationCommitCallback),
+		log:       newLog(operationCommitCallback, serializer),
 		leaderState: leaderState{
 			nextIndex:  make(map[machineID]int),
 			matchIndex: make(map[machineID]int),
@@ -86,8 +86,8 @@ func (m *GraftInstance[T]) Start() {
 	m.transitionToFollowerMode( /* term = */ 0)
 }
 
-// SendOperation replicates and commits an operation to the cluster wide replicated log :D
-func (m *GraftInstance[T]) SendOperation(operation T) {
+// ApplyOperation replicates and commits an operation to the cluster wide replicated log :D
+func (m *GraftInstance[T]) ApplyOperation(operation T) {
 	m.Lock()
 	defer m.Unlock()
 
