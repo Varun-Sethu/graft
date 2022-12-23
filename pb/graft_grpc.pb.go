@@ -24,6 +24,7 @@ const _ = grpc.SupportPackageIsVersion7
 type GraftClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteArgs, opts ...grpc.CallOption) (*RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesArgs, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
+	AddLogEntry(ctx context.Context, in *AddLogEntryArgs, opts ...grpc.CallOption) (*Empty, error)
 }
 
 type graftClient struct {
@@ -52,12 +53,22 @@ func (c *graftClient) AppendEntries(ctx context.Context, in *AppendEntriesArgs, 
 	return out, nil
 }
 
+func (c *graftClient) AddLogEntry(ctx context.Context, in *AddLogEntryArgs, opts ...grpc.CallOption) (*Empty, error) {
+	out := new(Empty)
+	err := c.cc.Invoke(ctx, "/Graft/AddLogEntry", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // GraftServer is the server API for Graft service.
 // All implementations must embed UnimplementedGraftServer
 // for forward compatibility
 type GraftServer interface {
 	RequestVote(context.Context, *RequestVoteArgs) (*RequestVoteResponse, error)
 	AppendEntries(context.Context, *AppendEntriesArgs) (*AppendEntriesResponse, error)
+	AddLogEntry(context.Context, *AddLogEntryArgs) (*Empty, error)
 	mustEmbedUnimplementedGraftServer()
 }
 
@@ -70,6 +81,9 @@ func (UnimplementedGraftServer) RequestVote(context.Context, *RequestVoteArgs) (
 }
 func (UnimplementedGraftServer) AppendEntries(context.Context, *AppendEntriesArgs) (*AppendEntriesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AppendEntries not implemented")
+}
+func (UnimplementedGraftServer) AddLogEntry(context.Context, *AddLogEntryArgs) (*Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddLogEntry not implemented")
 }
 func (UnimplementedGraftServer) mustEmbedUnimplementedGraftServer() {}
 
@@ -120,6 +134,24 @@ func _Graft_AppendEntries_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Graft_AddLogEntry_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddLogEntryArgs)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GraftServer).AddLogEntry(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/Graft/AddLogEntry",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GraftServer).AddLogEntry(ctx, req.(*AddLogEntryArgs))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Graft_ServiceDesc is the grpc.ServiceDesc for Graft service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -134,6 +166,10 @@ var Graft_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AppendEntries",
 			Handler:    _Graft_AppendEntries_Handler,
+		},
+		{
+			MethodName: "AddLogEntry",
+			Handler:    _Graft_AddLogEntry_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -73,9 +73,9 @@ func (log *Log[T]) updateCommitIndex(newCommitIndex int) {
 
 // SerializeRange returns all entries in the log within a range but serialized using the serializer
 // the goal is that they should be ready to transmit over gRPC
-func (log *Log[T]) serializeSubset(rangeStart, rangeEnd int) []*pb.LogEntry {
+func (log *Log[T]) serializeRange(rangeStart int) []*pb.LogEntry {
 	serializedResp := []*pb.LogEntry{}
-	for _, entry := range log.entries[rangeStart:rangeEnd] {
+	for _, entry := range log.entries[rangeStart:] {
 		serializedResp = append(serializedResp, &pb.LogEntry{
 			Entry:           log.serializer.ToString(entry.operation),
 			ApplicationTerm: entry.applicationTerm,

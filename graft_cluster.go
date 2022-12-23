@@ -62,10 +62,7 @@ func (c *cluster) appendEntryForMember(machineID machineID, entry *pb.AppendEntr
 
 	result, err := clusterMachine().AppendEntries(ctx, entry)
 	if err != nil {
-		return &pb.AppendEntriesResponse{
-			CurrentTerm: currentTerm,
-			Accepted:    false,
-		}
+		return nil
 	}
 
 	return result
@@ -106,6 +103,18 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
 
 	wg.Wait()
 	return int(totalVotes), newTerm
+}
+
+// pushOperationToLeader propagates an operation to the global cluster leader
+func (c *cluster) pushOperationToLeader(serializedOperation string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+
+	go func() {
+		c.machines[c.currentLeader]().AddLogEntry(ctx, &pb.AddLogEntryArgs{
+			Operation: serializedOperation,
+		})
+		cancel()
+	}()
 }
 
 func (c *cluster) clusterSize() int { return len(c.machines) }

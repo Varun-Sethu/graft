@@ -12,15 +12,17 @@ type (
 
 		electionTimeoutBound   time.Duration
 		currentElectionTimeout time.Duration
-		timer                  *time.Timer
+
+		isActive bool
+		timer    *time.Timer
 
 		// runElection should return a boolean indicating if the current machine
 		// won the election
-		runElection func() bool
+		runElection func()
 	}
 )
 
-func newElectionTimer(config graftConfig, electionRunner func() bool) *electionTimer {
+func newElectionTimer(config graftConfig, electionRunner func()) *electionTimer {
 	return &electionTimer{
 		electionTimeoutBound: config.electionTimeoutDuration,
 		runElection:          electionRunner,
@@ -29,29 +31,42 @@ func newElectionTimer(config graftConfig, electionRunner func() bool) *electionT
 
 // start actually starts the election timer and puts it in a state to begin triggering elections
 func (timer *electionTimer) start() {
-	// todo: figure out how to resolve this when called multiple times
-
 	timer.Lock()
+	defer timer.Unlock()
+
+	if timer.isActive {
+		return
+	}
+
 	timer.currentElectionTimeout = getRandomDuration(timer.electionTimeoutBound)
 	timer.timer = time.NewTimer(timer.currentElectionTimeout)
-	timer.Unlock()
+	timer.isActive = true
 
 	go func() {
 		// wait for the timer to end and rerun an election cycle afterwards
 		for range timer.timer.C {
-			wonElection := timer.runElection()
-			if !wonElection {
-				timer.Lock()
+			timer.runElection()
+
+			timer.Lock()
+			if timer.isActive {
 				timer.currentElectionTimeout = getRandomDuration(timer.electionTimeoutBound)
 				timer.timer.Reset(timer.currentElectionTimeout)
-				timer.Unlock()
 			}
+			timer.Unlock()
 		}
 	}()
 }
 
+// stops the timer countdown from occurring again
+func (timer *electionTimer) stop() {
+	timer.Lock()
+	defer timer.Unlock()
+
+	timer.isActive = false
+}
+
 // resets the timer countdown
-func (timer *electionTimer) resetTimer() {
+func (timer *electionTimer) reset() {
 	timer.Lock()
 	defer timer.Unlock()
 

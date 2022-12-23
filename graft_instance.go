@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	HEARTBEAT_DURATION = 50 * time.Millisecond
+	HEARTBEAT_DURATION = 10 * time.Millisecond
 )
 
 type (
@@ -86,6 +86,23 @@ func (m *GraftInstance[T]) Start() {
 	m.transitionToFollowerMode( /* term = */ 0)
 }
 
+// SendOperation replicates and commits an operation to the cluster wide replicated log :D
+func (m *GraftInstance[T]) SendOperation(operation T) {
+	m.Lock()
+	defer m.Unlock()
+
+	if m.cluster.currentLeader == m.machineId {
+		// replicate the entry by just adding it to the log
+		// the operation will then be propagated during future heartbeats
+		m.log.entries = append(m.log.entries, LogEntry[T]{
+			applicationTerm: m.electionState.currentTerm,
+			operation:       operation,
+		})
+	} else {
+		m.cluster.pushOperationToLeader(m.log.serializer.ToString(operation))
+	}
+}
+
 // transitions the graft state machine to follower mode
 func (m *GraftInstance[T]) transitionToFollowerMode(newTerm int64) {
 	m.electionState.currentTerm = newTerm
@@ -97,11 +114,13 @@ func (m *GraftInstance[T]) transitionToFollowerMode(newTerm int64) {
 
 // transitions the graft state machine to leader mode
 func (m *GraftInstance[T]) transitionToLeaderMode() {
+	m.cluster.currentLeader = m.machineId
+	m.electionState.electionTimer.stop()
 	m.leaderState.heartbeatTimer.Reset(HEARTBEAT_DURATION)
 }
 
 // runElection triggers an election by sending vote requests to all machines within the cluster
-func (m *GraftInstance[T]) runElection() bool {
+func (m *GraftInstance[T]) runElection() {
 	m.Lock()
 	defer m.Unlock()
 
@@ -117,8 +136,6 @@ func (m *GraftInstance[T]) runElection() bool {
 	if hasWonElection {
 		m.transitionToLeaderMode()
 	}
-
-	return hasWonElection
 }
 
 // sendHeartbeat involves just updating every single machine in the cluster with knowledge of the new leader
@@ -137,47 +154,27 @@ func (m *GraftInstance[T]) sendHeartbeat() {
 				PrevLogIndex: m.log.lastIndex(),
 				PrevLogTerm:  m.log.getLastEntry().applicationTerm,
 				LeaderCommit: int64(m.log.lastCommitted),
-				Entries: m.log.serializeSubset(
-					/*rangeStart = */ m.leaderState.matchIndex[memberID],
-					/* rangeEnd = */ m.leaderState.nextIndex[memberID],
+				Entries: m.log.serializeRange(
+					/* rangeStart = */ m.leaderState.nextIndex[memberID],
 				),
 			}
 			m.Unlock()
+
 			// the response from this heartbeat may dictate that we need to move to follower mode
 			// ie. we had an outdated term, also worth noting that the switch to follower function will
 			// already cancel any outbound requests
 			response := m.cluster.appendEntryForMember(memberID, heartbeatArgs, currentTerm)
+			if response == nil {
+				return
+			}
 
 			m.Lock()
 			if response.Accepted {
 				// update the meta-data tracking how much of memberID's log matches with outs
-				m.leaderState.matchIndex[memberID] = m.leaderState.nextIndex[memberID]
 				m.leaderState.nextIndex[memberID] += 1
-
-				// accepted response so its worth checking if we can update the commit index
-				// basically we want to see how much we can increase the commit index by
-				nextCommittableOperation := m.log.lastCommitted
-				for operationIndex := m.log.lastCommitted + 1; operationIndex < len(m.log.entries); operationIndex++ {
-					numReplicatedMachines := 0
-					for machineId := range m.cluster.machines {
-						if m.leaderState.matchIndex[machineId] >= operationIndex {
-							numReplicatedMachines += 1
-						}
-					}
-
-					committable := numReplicatedMachines > (m.cluster.clusterSize() / 2)
-					if committable {
-						nextCommittableOperation += 1
-					} else {
-						break
-					}
-				}
-
-				// trigger a commit for this new committable operation
-				m.log.lastCommitted = nextCommittableOperation
+				m.leaderState.matchIndex[memberID] = m.leaderState.nextIndex[memberID] - 1
+				m.log.updateCommitIndex(m.getNextCommittableIndex())
 			} else {
-				// request could have failed because of either a log inconsistency or because we're not actually leader
-				// deal with each case separately
 				if response.CurrentTerm > m.electionState.currentTerm {
 					m.transitionToFollowerMode( /* newTerm = */ response.CurrentTerm)
 				} else {
@@ -189,6 +186,29 @@ func (m *GraftInstance[T]) sendHeartbeat() {
 			m.Unlock()
 		}(memberID)
 	}
+}
+
+// getNextCommittableIndex determines the next index in this graft instance that we can commit
+// and alert to all other instances in this cluster
+func (m *GraftInstance[T]) getNextCommittableIndex() int {
+	nextCommittableOperation := m.log.lastCommitted
+	for candidateCommitIndex := m.log.lastCommitted + 1; candidateCommitIndex < len(m.log.entries); candidateCommitIndex++ {
+		numMachinesReplicatedOn := 0
+		for machineId := range m.cluster.machines {
+			if m.leaderState.matchIndex[machineId] >= candidateCommitIndex {
+				numMachinesReplicatedOn += 1
+			}
+		}
+
+		committable := numMachinesReplicatedOn > (m.cluster.clusterSize() / 2)
+		if committable {
+			nextCommittableOperation = candidateCommitIndex
+		} else {
+			break
+		}
+	}
+
+	return nextCommittableOperation
 }
 
 // ==== gRPC stub implementations ====
@@ -210,7 +230,6 @@ func (m *GraftInstance[T]) RequestVote(ctx context.Context, args *pb.RequestVote
 
 	logUpToDate := m.log.entries[args.LastLogIndex].applicationTerm == args.LastLogTerm
 	eligibleForElection := args.Term >= m.electionState.currentTerm && logUpToDate && !m.electionState.hasVoted
-
 	if eligibleForElection {
 		m.electionState.hasVoted = true
 	}
@@ -237,6 +256,7 @@ func (m *GraftInstance[T]) AppendEntries(ctx context.Context, args *pb.AppendEnt
 
 	requestIsAccepted := args.Term >= m.electionState.currentTerm && m.log.entries[args.PrevLogIndex].applicationTerm == args.PrevLogTerm
 	if requestIsAccepted {
+		m.cluster.currentLeader = args.LeaderId
 		m.log.appendEntries(args.Entries, int(args.PrevLogIndex), args.PrevLogTerm)
 		m.log.updateCommitIndex(int(args.LeaderCommit))
 	}
@@ -245,6 +265,21 @@ func (m *GraftInstance[T]) AppendEntries(ctx context.Context, args *pb.AppendEnt
 		CurrentTerm: m.electionState.currentTerm,
 		Accepted:    requestIsAccepted,
 	}, nil
+}
+
+// AddLogEntry assumes this machine is the leader and it requests us to add a log entry to the log
+func (m *GraftInstance[T]) AddLogEntry(ctx context.Context, args *pb.AddLogEntryArgs) (*pb.Empty, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	if m.cluster.currentLeader == m.machineId {
+		m.log.entries = append(m.log.entries, LogEntry[T]{
+			applicationTerm: m.electionState.currentTerm,
+			operation:       m.log.serializer.FromString(args.Operation),
+		})
+	}
+
+	return nil, nil
 }
 
 // contextIsCancelled is a smaller helper function to determine if a context is cancelled
