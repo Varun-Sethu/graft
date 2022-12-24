@@ -25,7 +25,7 @@ type (
 
 		electionState electionState
 		leaderState   leaderState
-		log           Log[T]
+		log           replicatedLog[T]
 	}
 
 	// models any meta-data associated with an election
@@ -94,7 +94,7 @@ func (m *GraftInstance[T]) ApplyOperation(operation T) {
 	if m.cluster.currentLeader == m.machineId {
 		// replicate the entry by just adding it to the log
 		// the operation will then be propagated during future heartbeats
-		m.log.entries = append(m.log.entries, LogEntry[T]{
+		m.log.entries = append(m.log.entries, logEntry[T]{
 			applicationTerm: m.electionState.currentTerm,
 			operation:       operation,
 		})
@@ -148,14 +148,15 @@ func (m *GraftInstance[T]) sendHeartbeat() {
 	for memberID := range m.cluster.machines {
 		go func(memberID machineID) {
 			m.Lock()
+			nextIndex := m.leaderState.nextIndex[memberID]
 			heartbeatArgs := &pb.AppendEntriesArgs{
 				Term:         currentTerm,
 				LeaderId:     m.machineId,
-				PrevLogIndex: m.log.lastIndex(),
-				PrevLogTerm:  m.log.getLastEntry().applicationTerm,
+				PrevLogIndex: int64(nextIndex - 1),
+				PrevLogTerm:  m.log.getPrevEntry(nextIndex).applicationTerm,
 				LeaderCommit: int64(m.log.lastCommitted),
 				Entries: m.log.serializeRange(
-					/* rangeStart = */ m.leaderState.nextIndex[memberID],
+					/* rangeStart = */ nextIndex,
 				),
 			}
 			m.Unlock()
@@ -254,10 +255,16 @@ func (m *GraftInstance[T]) AppendEntries(ctx context.Context, args *pb.AppendEnt
 		m.transitionToFollowerMode( /* newTerm = */ m.electionState.currentTerm)
 	}
 
-	requestIsAccepted := args.Term >= m.electionState.currentTerm && m.log.entries[args.PrevLogIndex].applicationTerm == args.PrevLogTerm
+	requestIsAccepted := args.Term >= m.electionState.currentTerm &&
+		(args.PrevLogIndex == -1 ||
+			m.log.entries[args.PrevLogIndex].applicationTerm == args.PrevLogTerm)
+
 	if requestIsAccepted {
 		m.cluster.currentLeader = args.LeaderId
-		m.log.appendEntries(args.Entries, int(args.PrevLogIndex), args.PrevLogTerm)
+		m.log.appendEntries(
+			/* applicationIndex = */ int(args.PrevLogIndex)+1,
+			args.Entries,
+		)
 		m.log.updateCommitIndex(int(args.LeaderCommit))
 	}
 
@@ -273,7 +280,7 @@ func (m *GraftInstance[T]) AddLogEntry(ctx context.Context, args *pb.AddLogEntry
 	defer m.Unlock()
 
 	if m.cluster.currentLeader == m.machineId {
-		m.log.entries = append(m.log.entries, LogEntry[T]{
+		m.log.entries = append(m.log.entries, logEntry[T]{
 			applicationTerm: m.electionState.currentTerm,
 			operation:       m.log.serializer.FromString(args.Operation),
 		})

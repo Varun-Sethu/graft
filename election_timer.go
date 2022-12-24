@@ -48,11 +48,19 @@ func (timer *electionTimer) start() {
 			timer.runElection()
 
 			timer.Lock()
-			if timer.isActive {
+			timerIsActive := timer.isActive
+			timer.Unlock()
+
+			if timerIsActive {
+				timer.Lock()
 				timer.currentElectionTimeout = getRandomDuration(timer.electionTimeoutBound)
 				timer.timer.Reset(timer.currentElectionTimeout)
+				timer.Unlock()
+			} else {
+				// terminate this goroutine since this timer is done anyways
+				// (basically to prevent goroutine leaks)
+				return
 			}
-			timer.Unlock()
 		}
 	}()
 }
@@ -63,6 +71,7 @@ func (timer *electionTimer) stop() {
 	defer timer.Unlock()
 
 	timer.isActive = false
+	timer.timer.Stop()
 }
 
 // resets the timer countdown
@@ -75,6 +84,6 @@ func (timer *electionTimer) reset() {
 
 func getRandomDuration(durationBound time.Duration) time.Duration {
 	rand.Seed(time.Now().Unix())
-	newTimeout := rand.Int63n(durationBound.Milliseconds()) + durationBound.Milliseconds()
+	newTimeout := rand.Int63n(durationBound.Nanoseconds()) + durationBound.Nanoseconds()
 	return time.Duration(newTimeout)
 }
