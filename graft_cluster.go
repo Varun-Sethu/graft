@@ -9,6 +9,7 @@ import (
 	"graft/pb"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // models an actual cluster of graft instances and provides abstractions for interfacing with all of them
@@ -40,7 +41,7 @@ func connectToCluster(config graftConfig, thisMachinesID machineID) *cluster {
 		}
 
 		newCluster.machines[machineID] = connectToMachine(machineAddr)
-		newCluster.machineCancellationFuncs.Store(machineID, func() {})
+		newCluster.machineCancellationFuncs.Store(machineID, context.CancelFunc(func() {}))
 	}
 
 	return &newCluster
@@ -51,7 +52,7 @@ func connectToCluster(config graftConfig, thisMachinesID machineID) *cluster {
 func (c *cluster) appendEntryForMember(machineID machineID, entry *pb.AppendEntriesArgs, currentTerm int64) *pb.AppendEntriesResponse {
 	// cancel any outbound request and create a new one
 	cancelExistingReqForMachine, _ := c.machineCancellationFuncs.Load(machineID)
-	cancelExistingReqForMachine.(func())()
+	(cancelExistingReqForMachine.(context.CancelFunc))()
 
 	machineContext, cancelFunc := context.WithCancel(context.Background())
 	c.machineCancellationFuncs.Store(machineID, cancelFunc)
@@ -85,9 +86,14 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
 		go func(clusterMachine pb.GraftClient) {
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
+			defer wg.Done()
 
 			voteResult, err := clusterMachine.RequestVote(ctx, voteRequest)
-			if err == nil && voteResult.VoteGranted {
+			if err != nil {
+				return
+			}
+
+			if voteResult.VoteGranted {
 				atomic.AddInt32(&totalVotes, 1)
 			}
 
@@ -96,8 +102,6 @@ func (c *cluster) requestVote(voteRequest *pb.RequestVoteArgs) (int, int) {
 				newTerm = int(voteResult.CurrentTerm)
 			}
 			termLock.Unlock()
-
-			wg.Done()
 		}(clusterMachine())
 	}
 
@@ -126,7 +130,7 @@ func connectToMachine(addr string) lazyClient {
 
 	return func() pb.GraftClient {
 		once.Do(func() {
-			opts := []grpc.DialOption{}
+			opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 
 			conn, err := grpc.Dial(addr, opts...)
 			if err != nil {

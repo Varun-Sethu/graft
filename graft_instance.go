@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	HEARTBEAT_DURATION = 10 * time.Millisecond
+	heartbeatDuration = 10 * time.Millisecond
 )
 
 type (
@@ -59,7 +59,7 @@ func NewGraftInstance[T any](configuration []byte, thisMachineID machineID, oper
 
 	// setup timers and callbacks
 	instance.electionState.electionTimer = newElectionTimer(graftConfig /* electionRunner: */, instance.runElection)
-	instance.leaderState.heartbeatTimer = time.AfterFunc(HEARTBEAT_DURATION, instance.sendHeartbeat)
+	instance.leaderState.heartbeatTimer = time.AfterFunc(heartbeatDuration, instance.sendHeartbeat)
 	instance.leaderState.heartbeatTimer.Stop()
 
 	return instance
@@ -116,7 +116,7 @@ func (m *GraftInstance[T]) transitionToFollowerMode(newTerm int64) {
 func (m *GraftInstance[T]) transitionToLeaderMode() {
 	m.cluster.currentLeader = m.machineId
 	m.electionState.electionTimer.stop()
-	m.leaderState.heartbeatTimer.Reset(HEARTBEAT_DURATION)
+	m.leaderState.heartbeatTimer.Reset(heartbeatDuration)
 }
 
 // runElection triggers an election by sending vote requests to all machines within the cluster
