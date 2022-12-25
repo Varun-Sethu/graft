@@ -1,0 +1,5 @@
+electionTimeout: '150ms'
+configuration:
+  1: 'alpha:8080'
+  2: 'beta:8080'
+  3: 'gamma:8080'
